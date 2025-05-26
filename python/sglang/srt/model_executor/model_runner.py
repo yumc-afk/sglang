@@ -703,10 +703,23 @@ class ModelRunner:
         named_tensors: List[Tuple[str, Union[torch.Tensor, "LocalSerializedTensor"]]],
         load_format: Optional[str] = None,
     ):
+        # Unwrap tensors first
         named_tensors = [
             (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank))
             for name, tensor in named_tensors
         ]
+        
+        # Check if we need TP resharding
+        source_tp_size = getattr(self.server_args, 'source_tp_size', self.tp_size)
+        if source_tp_size != self.tp_size:
+            # Perform TP resharding
+            named_tensors = self._reshard_weights_for_tp(
+                named_tensors, 
+                source_tp_size, 
+                self.tp_size
+            )
+        
+        # Load weights
         if load_format == "direct":
             _model_load_weights_direct(self.model, named_tensors)
         elif load_format is None:
@@ -714,6 +727,172 @@ class ModelRunner:
         else:
             raise NotImplementedError(f"Unknown load_format={load_format}")
         return True, "Success"
+
+    def _reshard_weights_for_tp(
+        self,
+        named_tensors: List[Tuple[str, torch.Tensor]],
+        source_tp: int,
+        target_tp: int
+    ) -> List[Tuple[str, torch.Tensor]]:
+        """Perform distributed TP resharding.
+        
+        Args:
+            named_tensors: List of (name, tensor) pairs
+            source_tp: Source tensor parallelism size (training)
+            target_tp: Target tensor parallelism size (inference)
+            
+        Returns:
+            Resharded tensors for the current rank
+        """
+        if source_tp > target_tp:
+            raise NotImplementedError(
+                f"Reducing TP size from {source_tp} to {target_tp} is not supported yet"
+            )
+        
+        logger.info(
+            f"Performing TP resharding: source_tp={source_tp} -> target_tp={target_tp}, "
+            f"current rank={self.tp_rank}"
+        )
+        
+        # Calculate resharding parameters
+        expansion_factor = target_tp // source_tp
+        source_rank = self.tp_rank // expansion_factor
+        rank_in_expansion = self.tp_rank % expansion_factor
+        
+        # Create communication group for resharding
+        if not hasattr(self, '_reshard_group'):
+            import torch.distributed as dist
+            group_start = source_rank * expansion_factor
+            group_ranks = list(range(group_start, group_start + expansion_factor))
+            self._reshard_group = dist.new_group(ranks=group_ranks)
+            logger.info(f"Created resharding group: {group_ranks}")
+        
+        resharded = []
+        for name, tensor in named_tensors:
+            # Identify parameter type for sharding strategy
+            param_type = self._identify_param_type(name)
+            
+            if param_type in ["column_parallel", "moe_expert"]:
+                # Need to broadcast and slice
+                if rank_in_expansion == 0:
+                    # Source rank: broadcast to group
+                    dist.broadcast(tensor, src=self.tp_rank, group=self._reshard_group)
+                else:
+                    # Target rank: receive broadcast
+                    tensor = torch.empty_like(tensor)
+                    dist.broadcast(tensor, src=group_start, group=self._reshard_group)
+                
+                # Each rank slices its portion
+                if param_type == "column_parallel":
+                    sliced_tensor = self._slice_column_parallel(
+                        tensor, rank_in_expansion, expansion_factor, name
+                    )
+                else:  # moe_expert
+                    sliced_tensor = self._slice_moe_expert(
+                        tensor, rank_in_expansion, expansion_factor, name
+                    )
+                
+                resharded.append((name, sliced_tensor))
+                
+            elif param_type == "row_parallel":
+                # Row parallel: each rank keeps full copy for now
+                # TODO: Optimize this for memory efficiency
+                resharded.append((name, tensor.contiguous()))
+                
+            else:
+                # Non-parallel parameters (LayerNorm, embeddings, etc.)
+                resharded.append((name, tensor))
+        
+        return resharded
+    
+    def _identify_param_type(self, param_name: str) -> str:
+        """Identify the parallelism type of a parameter."""
+        # MoE expert weights
+        if "experts" in param_name:
+            if any(x in param_name for x in ["w1", "w3", "w13"]):
+                return "moe_expert"
+            elif "w2" in param_name:
+                return "moe_expert"
+        
+        # Attention projections
+        if any(x in param_name for x in ["q_proj", "k_proj", "v_proj", "qkv_proj"]):
+            return "column_parallel"
+        if "o_proj" in param_name:
+            return "row_parallel"
+        
+        # MLA projections
+        if any(x in param_name for x in ["q_a_proj", "q_b_proj", "kv_a_proj", "kv_b_proj"]):
+            return "column_parallel"
+        
+        # FFN layers
+        if any(x in param_name for x in ["gate_proj", "up_proj", "w1", "w3"]):
+            return "column_parallel"
+        if any(x in param_name for x in ["down_proj", "w2"]):
+            return "row_parallel"
+        
+        # Default: non-parallel (replicated)
+        return "non_parallel"
+    
+    def _slice_column_parallel(
+        self,
+        tensor: torch.Tensor,
+        rank_in_expansion: int,
+        expansion_factor: int,
+        param_name: str
+    ) -> torch.Tensor:
+        """Slice a column-parallel tensor for the current rank."""
+        # Column parallel: split on output dimension (usually dim 0)
+        split_dim = 0
+        dim_size = tensor.shape[split_dim]
+        chunk_size = dim_size // expansion_factor
+        
+        start_idx = rank_in_expansion * chunk_size
+        end_idx = start_idx + chunk_size
+        
+        # Handle remainder
+        if rank_in_expansion == expansion_factor - 1:
+            end_idx = dim_size
+        
+        slices = [slice(None)] * tensor.ndim
+        slices[split_dim] = slice(start_idx, end_idx)
+        
+        return tensor[tuple(slices)].contiguous()
+    
+    def _slice_moe_expert(
+        self,
+        tensor: torch.Tensor,
+        rank_in_expansion: int,
+        expansion_factor: int,
+        param_name: str
+    ) -> torch.Tensor:
+        """Slice MoE expert weights for the current rank."""
+        # MoE weights typically have shape:
+        # w13_weight: [num_experts, 2*intermediate_size, hidden_size]
+        # w2_weight: [num_experts, hidden_size, intermediate_size]
+        
+        if "w13" in param_name or "w1" in param_name or "w3" in param_name:
+            # Split on hidden_size dimension
+            split_dim = 2
+        elif "w2" in param_name:
+            # Split on intermediate_size dimension
+            split_dim = 2
+        else:
+            # Default to last dimension
+            split_dim = -1
+        
+        dim_size = tensor.shape[split_dim]
+        chunk_size = dim_size // expansion_factor
+        
+        start_idx = rank_in_expansion * chunk_size
+        end_idx = start_idx + chunk_size
+        
+        if rank_in_expansion == expansion_factor - 1:
+            end_idx = dim_size
+        
+        slices = [slice(None)] * tensor.ndim
+        slices[split_dim] = slice(start_idx, end_idx)
+        
+        return tensor[tuple(slices)].contiguous()
 
     def get_weights_by_name(
         self, name: str, truncate_size: int = 100
